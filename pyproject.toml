@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-workflow-timer"
+description = "Live workflow execution timer (MM:SS:mmm) with a per-node timer and a previous-run comparison, in Oxanium, fading light green to red over a configurable number of minutes."
+version = "1.8.1"
+license = { text = "AGPL-3.0-or-later" }
+classifiers = [
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+]
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "Workflow Execution Timer"
+Icon = ""
