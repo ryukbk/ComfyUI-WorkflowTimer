@@ -1241,6 +1241,75 @@ bdGraph._nodes.splice(bdGraph._nodes.indexOf(sibling), 1);
 bdNode.onRemoved();
 bdGraph._nodes.splice(bdGraph._nodes.indexOf(bdNode), 1);
 
+// --- a Meta Batch run: the server re-queues the workflow once per batch ------------
+/* VHS's Meta Batch Manager puts each later batch on the queue from the server, with a new
+ * prompt_id this client never queued. Video Combine reports `unfinished_batch` on every
+ * batch but the last, which is what tells the timer the run is not over. */
+const batchPrompt = makePrompt({
+    7: ["WorkflowExecutionTimer", "Timer"],
+    42: ["KSampler", "My Sampler"],
+    35: ["VHS_VideoCombine", "Video Combine"],
+});
+const batchRun = await globalThis.__api.queuePrompt(1, batchPrompt);
+NOW = 40_000_000; emit("execution_start", { prompt_id: batchRun.prompt_id });
+emit("executing", { node: "42", prompt_id: batchRun.prompt_id });
+NOW = 40_010_000;
+emit("executing", { node: "35", prompt_id: batchRun.prompt_id });
+emit("executed", { node: "35", prompt_id: batchRun.prompt_id, output: { unfinished_batch: [true] } });
+emit("execution_success", { prompt_id: batchRun.prompt_id });
+// what the frontend really delivers at the end of a prompt: the node id alone, null
+emit("executing", null);
+check("an unfinished batch does not stop the clock", t.running === true);
+NOW = 40_011_000; pump();
+check("and it keeps counting between batches", t.view.total.textContent === "00:11:000", t.view.total.textContent);
+check("while saying what it is waiting for", t.view.detail.textContent === "waiting for batch 2…", t.view.detail.textContent);
+
+NOW = 40_012_000; emit("execution_start", { prompt_id: "requeued-by-server-1" });
+NOW = 40_013_000; pump();
+check("the server's re-queued batch joins the run", t.running === true && t.view.total.textContent === "00:13:000",
+      t.view.total.textContent);
+emit("executing", { node: "42", prompt_id: "requeued-by-server-1" });
+NOW = 40_014_000; pump();
+check("and its nodes are named from the run's prompt", t.view.detail.textContent.startsWith("My Sampler"), t.view.detail.textContent);
+emit("executed", { node: "35", prompt_id: "requeued-by-server-1", output: { unfinished_batch: [true] } });
+emit("execution_success", { prompt_id: "requeued-by-server-1" });
+emit("executing", null);
+check("a second unfinished batch carries on too", t.running === true);
+NOW = 40_015_000; pump();
+check("into batch 3", t.view.detail.textContent === "waiting for batch 3…", t.view.detail.textContent);
+
+/* The last batch missed its execution_start - a per-node event is enough to adopt it. */
+emit("executing", { node: "42", prompt_id: "requeued-by-server-2" });
+NOW = 40_020_000;
+emit("executed", { node: "35", prompt_id: "requeued-by-server-2", output: { gifs: [] } });
+emit("execution_success", { prompt_id: "requeued-by-server-2" });
+emit("executing", null);
+check("the last batch ends the run", t.running === false);
+check("with the total of every batch", t.view.total.textContent === "00:20:000", t.view.total.textContent);
+check("and a breakdown accumulated across them", t.breakdown?.some(([name]) => name === "My Sampler"));
+
+const afterBatches = await globalThis.__api.queuePrompt(1, batchPrompt);
+NOW = 41_000_000; emit("execution_start", { prompt_id: afterBatches.prompt_id });
+check("the whole Meta Batch run becomes the baseline", t.view.last.textContent === "00:20:000", t.view.last.textContent);
+emit("execution_success", { prompt_id: afterBatches.prompt_id });
+
+// negative controls: nothing but an unfinished batch of ours holds the clock open
+NOW = 41_001_000; emit("execution_start", { prompt_id: "someone-elses-run" });
+check("a run that is not a re-queued batch is still ignored", t.running === false);
+const otherRun = await globalThis.__api.queuePrompt(1, batchPrompt);
+NOW = 42_000_000; emit("execution_start", { prompt_id: otherRun.prompt_id });
+emit("executed", { node: "35", prompt_id: "a-foreign-prompt", output: { unfinished_batch: [true] } });
+emit("execution_success", { prompt_id: otherRun.prompt_id });
+check("another prompt's unfinished batch does not hold ours open", t.running === false);
+const failingBatch = await globalThis.__api.queuePrompt(1, batchPrompt);
+NOW = 43_000_000; emit("execution_start", { prompt_id: failingBatch.prompt_id });
+emit("executed", { node: "35", prompt_id: failingBatch.prompt_id, output: { unfinished_batch: [true] } });
+emit("execution_error", { prompt_id: failingBatch.prompt_id });
+check("an unfinished batch that errors still stops", t.running === false &&
+      t.view.detail.textContent === "stopped on error", t.view.detail.textContent);
+NOW = 43_001_000; emit("execution_start", { prompt_id: "after-the-error" });
+check("and nothing is left waiting to adopt", t.running === false);
+
 // --- ownership map does not grow without bound ---------------------------------
 const stale = await globalThis.__api.queuePrompt(1, prompt1);
 // only prompts that contain this node are ever recorded, so the filler must too

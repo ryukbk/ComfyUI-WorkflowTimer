@@ -331,6 +331,32 @@ function dropPending(entry) {
     if (at >= 0) pending.splice(at, 1);
 }
 
+/*
+ * Meta Batch runs - VideoHelperSuite's Meta Batch Manager, and the chains built on it - put
+ * the workflow back on the queue from the SERVER, once per batch. Every batch is a new
+ * prompt with a new prompt_id that never passed through api.queuePrompt, so by the rules
+ * above it belonged to nobody, and the clock froze at the end of the first batch.
+ *
+ * VHS says so in advance: on every batch but the last, its Video Combine reports
+ * `unfinished_batch` in its output. A prompt of ours that reports it is therefore not the
+ * end of the run. The clock keeps going through that prompt's end, and the next execution
+ * to start is adopted into the same run - VHS queues the batch at the front (a negative
+ * number), so the next execution is the batch. The last batch reports nothing and ends the
+ * run as usual, so the total, the breakdown and the baseline cover every batch.
+ */
+const requeued = [];         // {entry, at}
+const REQUEUE_WINDOW_MS = 120000;
+
+function pruneRequeued() {
+    const now = Date.now();
+    while (requeued.length && now - requeued[0].at > REQUEUE_WINDOW_MS) requeued.shift();
+}
+
+function isUnfinishedBatch(output) {
+    const flag = output?.unfinished_batch;
+    return Array.isArray(flag) ? flag.some(Boolean) : Boolean(flag);
+}
+
 function labelsFromPrompt(prompt) {
     /* The API prompt carries each node's workflow title in _meta.title - the same field
      * the server reads in execution.py - so titles come from the prompt rather than from
@@ -479,6 +505,23 @@ function entryFor(promptId, { adopt = false, node = null } = {}) {
         if (known) return known;
     }
     if (!adopt) return null;
+
+    // a batch of a Meta Batch run of ours, put back on the queue by the server
+    pruneRequeued();
+    const batch = node == null
+        ? (requeued.length ? 0 : -1)
+        : requeued.findIndex((slot) => slot.entry.labels?.has(String(node)));
+    if (batch >= 0) {
+        const entry = requeued.splice(batch, 1)[0].entry;
+        if (promptId != null) remember(promptId, entry);
+        if (entry.live) {
+            entry.live.awaiting = false;
+            entry.live.continued = true;
+        }
+        _log(`adopted the next batch of a Meta Batch run${promptId == null ? "" : ` (${promptId})`}`);
+        return entry;
+    }
+
     prunePending();
     const at = node == null
         ? (pending.length ? 0 : -1)
@@ -864,6 +907,7 @@ class Timer {
         this.frozenNode = 0;
         this.suffix = "";
         this.recovered = false;      // caught at execution_start, so the total is exact
+        this.waitingFor = null;
         // the run record carries it so that every timer in the workflow, including one that
         // rejoins later, compares against the same number
         this.baseline = entry?.live?.baseline ?? recallLastTotal(entry, this);
@@ -898,7 +942,18 @@ class Timer {
         this.loop();
     }
 
+    /* A Meta Batch batch of this run has ended and the next one is on its way: the run is
+     * still going, so the clock keeps counting, but no node is executing. */
+    awaitBatch(number) {
+        this.endNode();
+        this.nodeLabel = "";
+        this.nodeId = null;
+        this.waitingFor = `waiting for batch ${number}…`;
+        this.render();
+    }
+
     beginNode(label, id = null) {
+        this.waitingFor = null;
         this.nodeLabel = label;
         this.nodeId = id == null ? null : String(id);
         this.nodeStartedAt = performance.now();
@@ -942,6 +997,7 @@ class Timer {
         this.nodeLabel = "";
         this.nodeId = null;
         this.frozenNode = 0;
+        this.waitingFor = null;
         /* Only replace the stored breakdown when this run actually measured something. A stop
          * with nothing behind it - the run was another tab's, or the timer was never started -
          * must not wipe out the last real one. */
@@ -1061,7 +1117,7 @@ class Timer {
         if (this.nodeLabel) {
             line = `${this.nodeLabel} — ${formatMs(this.nodeMs())}`;
         } else if (this.running) {
-            line = "waiting for the first node…";
+            line = this.waitingFor || "waiting for the first node…";
         } else if (this.suffix && this.suffix !== "idle") {
             line = this.suffix;                 // why it stopped outranks any statistic
         } else if (this.breakdown?.length) {
@@ -1178,6 +1234,24 @@ function recoverRun(entry, timer) {
         _log("a run was already in progress; starting the count from here");
     }
     timer.resume(entry, entry.live);
+    return true;
+}
+
+/* A prompt of ours has ended. If it was a Meta Batch batch with more to come, the run carries
+ * on into the next batch instead of ending: true then, and the caller does not stop it. */
+function holdForNextBatch(promptId, entry) {
+    if (promptId == null || entry?.unfinishedBatch !== String(promptId)) return false;
+    entry.unfinishedBatch = null;
+    if (!entry.live) return false;
+    entry.live.batch = (entry.live.batch ?? 1) + 1;
+    entry.live.awaiting = true;
+    entry.live.nodeId = null;
+    entry.live.nodeLabel = "";
+    forEachTimer(entry, (timer) => { if (timer.running) timer.awaitBatch(entry.live.batch); });
+    owners.delete(String(promptId));
+    pruneRequeued();
+    requeued.push({ entry, at: Date.now() });
+    _log(`batch ${entry.live.batch - 1} done; waiting for batch ${entry.live.batch}`);
     return true;
 }
 
@@ -1464,6 +1538,15 @@ function registerEvents() {
         // adopt: on a repeat run the websocket routinely beats the queue response
         const entry = entryFor(promptIdOf(detail), { adopt: true });
         if (!entry) return;            // another workflow, another tab, or the API: ignore
+        if (entry.live?.continued) {
+            // the next batch of a Meta Batch run: the same run, so the clock carries on
+            entry.live.continued = false;
+            forEachTimer(entry, (timer) => {
+                if (!timer.running) timer.resume(entry, entry.live);
+                else timer.render();
+            });
+            return;
+        }
         entry.live = { startedAt: performance.now(), nodeId: null, nodeLabel: "", nodeStartedAt: 0, baseline: null };
         // one baseline for the whole run, so two timers in the same workflow - and any node
         // that rejoins the run later - all compare against the same previous total
@@ -1496,10 +1579,18 @@ function registerEvents() {
             // the classic "execution finished" signal - a completion, so it sets the baseline
             const entry = entryFor(promptId);
             if (entry) {
+                if (holdForNextBatch(promptId, entry)) return;
                 entry.live = null;
                 forEachTimer(entry, (timer) => timer.stop(undefined, true));   // -> "idle"
             } else if (promptId == null) {
-                forEachRunningTimer((timer) => { if (timer.entry) timer.entry.live = null; timer.stop(undefined, true); });
+                /* The frontend delivers "executing" as the bare node id, so this end-of-prompt
+                 * signal has no prompt_id at all. A run held open for its next Meta Batch batch
+                 * has not ended: execution_success already said so, with its prompt_id. */
+                forEachRunningTimer((timer) => {
+                    if (timer.entry?.live?.awaiting) return;
+                    if (timer.entry) timer.entry.live = null;
+                    timer.stop(undefined, true);
+                });
             }
             return;
         }
@@ -1541,6 +1632,7 @@ function registerEvents() {
         const promptId = promptIdOf(detail);
         const entry = entryFor(promptId);
         if (entry) {
+            if (completed && holdForNextBatch(promptId, entry)) return;
             entry.live = null;         // the run is over; nothing left to rejoin
             forEachTimer(entry, (timer) => timer.stop(suffix, completed));
         }
@@ -1549,6 +1641,14 @@ function registerEvents() {
         }
         if (promptId != null) owners.delete(String(promptId));
     };
+
+    /* A Meta Batch batch that is not the last: see `requeued`. */
+    api.addEventListener("executed", ({ detail }) => {
+        if (!isUnfinishedBatch(detail?.output)) return;
+        const promptId = promptIdOf(detail);
+        const entry = entryFor(promptId);
+        if (entry && promptId != null) entry.unfinishedBatch = String(promptId);
+    });
 
     api.addEventListener("execution_success", finish(undefined, true));   // -> "idle"
     api.addEventListener("execution_error", finish("stopped on error"));
